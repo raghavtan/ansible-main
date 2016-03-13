@@ -34,7 +34,7 @@ from ansible.inventory.script import InventoryScript
 
 __all__ = ['get_file_parser']
 
-def get_file_parser(hostsfile, loader):
+def get_file_parser(hostsfile, groups, loader):
     # check to see if the specified file starts with a
     # shebang (#!/), so if an error is raised by the parser
     # class we can show a more apropos error
@@ -55,7 +55,7 @@ def get_file_parser(hostsfile, loader):
 
     if loader.is_executable(hostsfile):
         try:
-            parser = InventoryScript(loader=loader, filename=hostsfile)
+            parser = InventoryScript(loader=loader, groups=groups, filename=hostsfile)
             processed = True
         except Exception as e:
             myerr.append("The file %s is marked as executable, but failed to execute correctly. " % hostsfile + \
@@ -64,7 +64,7 @@ def get_file_parser(hostsfile, loader):
 
     if not processed:
         try:
-            parser = InventoryINIParser(loader=loader, filename=hostsfile)
+            parser = InventoryINIParser(loader=loader, groups=groups, filename=hostsfile)
             processed = True
         except Exception as e:
             if shebang_present and not loader.is_executable(hostsfile):
@@ -81,13 +81,16 @@ def get_file_parser(hostsfile, loader):
 class InventoryDirectory(object):
     ''' Host inventory parser for ansible using a directory of inventories. '''
 
-    def __init__(self, loader, filename=C.DEFAULT_HOST_LIST):
+    def __init__(self, loader, groups=None, filename=C.DEFAULT_HOST_LIST):
+        if groups is None:
+            groups = dict()
+
         self.names = os.listdir(filename)
         self.names.sort()
         self.directory = filename
         self.parsers = []
         self.hosts = {}
-        self.groups = {}
+        self.groups = groups
 
         self._loader = loader
 
@@ -104,9 +107,9 @@ class InventoryDirectory(object):
                 continue
             fullpath = os.path.join(self.directory, i)
             if os.path.isdir(fullpath):
-                parser = InventoryDirectory(loader=loader, filename=fullpath)
+                parser = InventoryDirectory(loader=loader, groups=groups, filename=fullpath)
             else:
-                parser = get_file_parser(fullpath, loader)
+                parser = get_file_parser(fullpath, self.groups, loader)
                 if parser is None:
                     #FIXME: needs to use display
                     import warnings
@@ -189,6 +192,8 @@ class InventoryDirectory(object):
         if group.name not in self.groups:
             # it's brand new, add him!
             self.groups[group.name] = group
+        # the Group class does not (yet) implement __eq__/__ne__,
+        # so unlike Host we do a regular comparison here
         if self.groups[group.name] != group:
             # different object, merge
             self._merge_groups(self.groups[group.name], group)
@@ -197,6 +202,9 @@ class InventoryDirectory(object):
         if host.name not in self.hosts:
             # Papa's got a brand new host
             self.hosts[host.name] = host
+        # because the __eq__/__ne__ methods in Host() compare the
+        # name fields rather than references, we use id() here to
+        # do the object comparison for merges
         if self.hosts[host.name] != host:
             # different object, merge
             self._merge_hosts(self.hosts[host.name], host)

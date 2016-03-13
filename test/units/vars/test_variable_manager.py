@@ -75,6 +75,9 @@ class TestVariableManager(unittest.TestCase):
                foo: bam
                baa: bat
             """,
+            "host_vars/host.name.yml": """
+               host_with_dots: true
+            """,
         })
 
         v = VariableManager()
@@ -92,6 +95,9 @@ class TestVariableManager(unittest.TestCase):
         self.assertEqual(v.get_vars(loader=fake_loader, host=mock_host, use_cache=False).get("foo"), "bam")
         self.assertEqual(v.get_vars(loader=fake_loader, host=mock_host, use_cache=False).get("baa"), "bat")
 
+        v.add_host_vars_file("host_vars/host.name", loader=fake_loader)
+        self.assertEqual(v._host_vars_files["host.name"], [dict(host_with_dots=True)])
+
     def test_variable_manager_group_vars_file(self):
         fake_loader = DictDataLoader({
             "group_vars/all.yml": """
@@ -102,7 +108,10 @@ class TestVariableManager(unittest.TestCase):
             """,
             "other_path/group_vars/somegroup.yml": """
                baa: bat
-            """
+            """,
+            "group_vars/some.group.yml": """
+               group_with_dots: true
+            """,
         })
 
         v = VariableManager()
@@ -127,6 +136,9 @@ class TestVariableManager(unittest.TestCase):
         vars = v.get_vars(loader=fake_loader, host=mock_host, use_cache=False)
         self.assertEqual(vars.get("foo"), "bar")
         self.assertEqual(vars.get("baa"), "bat")
+
+        v.add_group_vars_file("group_vars/some.group", loader=fake_loader)
+        self.assertEqual(v._group_vars_files["some.group"], [dict(group_with_dots=True)])
 
     def test_variable_manager_play_vars(self):
         fake_loader = DictDataLoader({})
@@ -159,12 +171,15 @@ class TestVariableManager(unittest.TestCase):
 
         mock_task = MagicMock()
         mock_task._role = None
+        mock_task.loop = None
         mock_task.get_vars.return_value = dict(foo="bar")
+        mock_task.get_include_params.return_value = dict()
 
         v = VariableManager()
         self.assertEqual(v.get_vars(loader=fake_loader, task=mock_task, use_cache=False).get("foo"), "bar")
 
-    def test_variable_manager_precedence(self):
+    @patch.object(Inventory, 'basedir')
+    def test_variable_manager_precedence(self, mock_basedir):
         '''
         Tests complex variations and combinations of get_vars() with different
         objects to modify the context under which variables are merged.
@@ -211,6 +226,7 @@ class TestVariableManager(unittest.TestCase):
             """,
         })
 
+        mock_basedir.return_value = './'
         inv1 = Inventory(loader=fake_loader, variable_manager=v, host_list='/etc/ansible/inventory1')
         inv1.set_playbook_basedir('./')
 

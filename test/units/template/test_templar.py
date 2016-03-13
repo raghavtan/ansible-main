@@ -25,7 +25,7 @@ from ansible.compat.tests.mock import patch, MagicMock
 from ansible import constants as C
 from ansible.errors import *
 from ansible.plugins import filter_loader, lookup_loader, module_loader
-from ansible.plugins.strategies import SharedPluginLoaderObj
+from ansible.plugins.strategy import SharedPluginLoaderObj
 from ansible.template import Templar
 
 from units.mock.loader import DictDataLoader
@@ -70,8 +70,6 @@ class TestTemplar(unittest.TestCase):
         self.assertEqual(templar.template("{{bad_dict}}"), "{a='b'")
         self.assertEqual(templar.template("{{var_list}}"), [1])
         self.assertEqual(templar.template(1, convert_bare=True), 1)
-        #FIXME: lookup ignores fake file and returns error
-        #self.assertEqual(templar.template("{{lookup('file', '/path/to/my_file.txt')}}"), "foo")
 
         # force errors
         self.assertRaises(AnsibleUndefinedVariable, templar.template, "{{bad_var}}")

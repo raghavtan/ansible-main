@@ -20,9 +20,7 @@ __metaclass__ = type
 import base64
 import os
 import re
-import random
 import shlex
-import time
 
 from ansible.utils.unicode import to_bytes, to_unicode
 
@@ -36,6 +34,13 @@ if _powershell_version:
 
 class ShellModule(object):
 
+    # Common shell filenames that this plugin handles
+    # Powershell is handled differently.  It's selected when winrm is the
+    # connection
+    COMPATIBLE_SHELLS = frozenset()
+    # Family of shells this has.  Must match the filename without extension
+    SHELL_FAMILY = 'powershell'
+
     def env_prefix(self, **kwargs):
         return ''
 
@@ -48,6 +53,13 @@ class ShellModule(object):
         if path.startswith('~'):
             return path
         return '"%s"' % path
+
+    # powershell requires that script files end with .ps1
+    def get_remote_filename(self, base_name):
+        if not base_name.strip().lower().endswith('.ps1'):
+            return base_name.strip() + '.ps1'
+
+        return base_name.strip()
 
     def path_has_trailing_slash(self, path):
         # Allow Windows paths to be specified using either slash.
@@ -103,7 +115,7 @@ class ShellModule(object):
         ''' % dict(path=path)
         return self._encode_script(script)
 
-    def build_module_command(self, env_string, shebang, cmd, rm_tmp=None):
+    def build_module_command(self, env_string, shebang, cmd, arg_path=None, rm_tmp=None):
         cmd_parts = shlex.split(to_bytes(cmd), posix=False)
         cmd_parts = map(to_unicode, cmd_parts)
         if shebang and shebang.lower() == '#!powershell':
@@ -112,12 +124,41 @@ class ShellModule(object):
             cmd_parts.insert(0, '&')
         elif shebang and shebang.startswith('#!'):
             cmd_parts.insert(0, shebang[2:])
-        catch = '''
-            $_obj = @{ failed = $true; $msg = $_ }
-            echo $_obj | ConvertTo-Json -Compress -Depth 99
-            Exit 1
-        '''
-        script = 'Try { %s }\nCatch { %s }' % (' '.join(cmd_parts), 'throw')
+        script = '''
+            Try
+            {
+                %s
+            }
+            Catch
+            {
+                $_obj = @{ failed = $true }
+                If ($_.Exception.GetType)
+                {
+                    $_obj.Add('msg', $_.Exception.Message)
+                }
+                Else
+                {
+                    $_obj.Add('msg', $_.ToString())
+                }
+                If ($_.InvocationInfo.PositionMessage)
+                {
+                    $_obj.Add('exception', $_.InvocationInfo.PositionMessage)
+                }
+                ElseIf ($_.ScriptStackTrace)
+                {
+                    $_obj.Add('exception', $_.ScriptStackTrace)
+                }
+                Try
+                {
+                    $_obj.Add('error_record', ($_ | ConvertTo-Json | ConvertFrom-Json))
+                }
+                Catch
+                {
+                }
+                Echo $_obj | ConvertTo-Json -Compress -Depth 99
+                Exit 1
+            }
+        ''' % (' '.join(cmd_parts))
         if rm_tmp:
             rm_tmp = self._escape(self._unquote(rm_tmp))
             rm_cmd = 'Remove-Item "%s" -Force -Recurse -ErrorAction SilentlyContinue' % rm_tmp
@@ -149,9 +190,11 @@ class ShellModule(object):
         replace = lambda m: substs[m.lastindex - 1]
         return re.sub(pattern, replace, value)
 
-    def _encode_script(self, script, as_list=False):
+    def _encode_script(self, script, as_list=False, strict_mode=True):
         '''Convert a PowerShell script to a single base64-encoded command.'''
         script = to_unicode(script)
+        if strict_mode:
+            script = u'Set-StrictMode -Version Latest\r\n%s' % script
         script = '\n'.join([x.strip() for x in script.splitlines() if x.strip()])
         encoded_script = base64.b64encode(script.encode('utf-16-le'))
         cmd_parts = _common_args + ['-EncodedCommand', encoded_script]

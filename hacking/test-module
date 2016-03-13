@@ -36,7 +36,7 @@ import subprocess
 import traceback
 import optparse
 import ansible.utils.vars as utils_vars
-from ansible.parsing import DataLoader
+from ansible.parsing.dataloader import DataLoader
 from ansible.parsing.utils.jsonify import jsonify
 from ansible.parsing.splitter import parse_kv
 import ansible.executor.module_common as module_common
@@ -129,7 +129,7 @@ def boilerplate_module(modfile, args, interpreter, check, destfile):
         task_vars[interpreter_type] = interpreter_path
 
     if check:
-         complex_args['CHECKMODE'] = True
+         complex_args['_ansible_check_mode'] = True
 
     (module_data, module_style, shebang) = module_common.modify_module(
         modfile,

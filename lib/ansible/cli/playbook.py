@@ -18,6 +18,10 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 ########################################################
+
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
 import os
 import stat
 
@@ -25,9 +29,17 @@ from ansible.cli import CLI
 from ansible.errors import AnsibleError, AnsibleOptionsError
 from ansible.executor.playbook_executor import PlaybookExecutor
 from ansible.inventory import Inventory
-from ansible.parsing import DataLoader
+from ansible.parsing.dataloader import DataLoader
+from ansible.playbook.play_context import PlayContext
 from ansible.utils.vars import load_extra_vars
 from ansible.vars import VariableManager
+
+try:
+    from __main__ import display
+except ImportError:
+    from ansible.utils.display import Display
+    display = Display()
+
 
 #---------------------------------------------------------------------------------------------------
 
@@ -61,7 +73,7 @@ class PlaybookCLI(CLI):
         parser.add_option('--start-at-task', dest='start_at_task',
             help="start the playbook at the task matching this name")
 
-        self.options, self.args = parser.parse_args()
+        self.options, self.args = parser.parse_args(self.args[1:])
 
 
         self.parser = parser
@@ -69,7 +81,7 @@ class PlaybookCLI(CLI):
         if len(self.args) == 0:
             raise AnsibleOptionsError("You must specify a playbook file to run")
 
-        self.display.verbosity = self.options.verbosity
+        display.verbosity = self.options.verbosity
         self.validate_conflicts(runas_opts=True, vault_opts=True, fork_opts=True)
 
     def run(self):
@@ -96,7 +108,7 @@ class PlaybookCLI(CLI):
             vault_pass = CLI.read_vault_password_file(self.options.vault_password_file, loader=loader)
             loader.set_vault_password(vault_pass)
         elif self.options.ask_vault_pass:
-            vault_pass = self.ask_vault_passwords(ask_vault_pass=True, ask_new_vault_pass=False, confirm_new=False)[0]
+            vault_pass = self.ask_vault_passwords()[0]
             loader.set_vault_password(vault_pass)
 
         # initial error check, to make sure all specified playbooks are accessible
@@ -125,7 +137,7 @@ class PlaybookCLI(CLI):
         no_hosts = False
         if len(inventory.list_hosts()) == 0:
             # Empty inventory
-            self.display.warning("provided hosts list is empty, only localhost is available")
+            display.warning("provided hosts list is empty, only localhost is available")
             no_hosts = True
         inventory.subset(self.options.subset)
         if len(inventory.list_hosts()) == 0 and no_hosts is False:
@@ -133,26 +145,18 @@ class PlaybookCLI(CLI):
             raise AnsibleError("Specified --limit does not match any hosts")
 
         # create the playbook executor, which manages running the plays via a task queue manager
-        pbex = PlaybookExecutor(playbooks=self.args, inventory=inventory, variable_manager=variable_manager, loader=loader, display=self.display, options=self.options, passwords=passwords)
+        pbex = PlaybookExecutor(playbooks=self.args, inventory=inventory, variable_manager=variable_manager, loader=loader, options=self.options, passwords=passwords)
 
         results = pbex.run()
 
         if isinstance(results, list):
             for p in results:
 
-                self.display.display('\nplaybook: %s' % p['playbook'])
-                i = 1
-                for play in p['plays']:
-                    if play.name:
-                        playname = play.name
-                    else:
-                        playname = '#' + str(i)
-
-                    msg = "\n  PLAY: %s" % (playname)
-                    mytags = set()
-                    if self.options.listtags and play.tags:
-                        mytags = mytags.union(set(play.tags))
-                        msg += '    TAGS: [%s]' % (','.join(mytags))
+                display.display('\nplaybook: %s' % p['playbook'])
+                for idx, play in enumerate(p['plays']):
+                    msg = "\n  play #%d (%s): %s" % (idx + 1, ','.join(play.hosts), play.name)
+                    mytags = set(play.tags)
+                    msg += '\tTAGS: [%s]' % (','.join(mytags))
 
                     if self.options.listhosts:
                         playhosts = set(inventory.get_hosts(play.hosts))
@@ -160,25 +164,42 @@ class PlaybookCLI(CLI):
                         for host in playhosts:
                             msg += "\n      %s" % host
 
-                    self.display.display(msg)
+                    display.display(msg)
 
+                    all_tags = set()
                     if self.options.listtags or self.options.listtasks:
-                        taskmsg = '    tasks:'
+                        taskmsg = ''
+                        if self.options.listtasks:
+                            taskmsg = '    tasks:\n'
 
+                        all_vars = variable_manager.get_vars(loader=loader, play=play)
+                        play_context = PlayContext(play=play, options=self.options)
                         for block in play.compile():
+                            block = block.filter_tagged_tasks(play_context, all_vars)
                             if not block.has_tasks():
                                 continue
 
-                            j = 1
                             for task in block.block:
-                                taskmsg += "\n      %s" % task
-                                if self.options.listtags and task.tags:
-                                    taskmsg += "    TAGS: [%s]" % ','.join(mytags.union(set(task.tags)))
-                                j = j + 1
+                                if task.action == 'meta':
+                                    continue
 
-                        self.display.display(taskmsg)
+                                all_tags.update(task.tags)
+                                if self.options.listtasks:
+                                    cur_tags = list(mytags.union(set(task.tags)))
+                                    cur_tags.sort()
+                                    if task.name:
+                                        taskmsg += "      %s" % task.get_name()
+                                    else:
+                                        taskmsg += "      %s" % task.action
+                                    taskmsg += "\tTAGS: [%s]\n" % ', '.join(cur_tags)
 
-                    i = i + 1
+                        if self.options.listtags:
+                            cur_tags = list(mytags.union(all_tags))
+                            cur_tags.sort()
+                            taskmsg += "      TASK TAGS: [%s]\n" % ', '.join(cur_tags)
+
+                        display.display(taskmsg)
+
             return 0
         else:
             return results

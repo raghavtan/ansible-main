@@ -19,7 +19,6 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import pwd
 import os
 
 from ansible.compat.tests import unittest
@@ -55,7 +54,7 @@ class TestPlayContext(unittest.TestCase):
         play_context = PlayContext(options=options)
         self.assertEqual(play_context.connection, 'smart')
         self.assertEqual(play_context.remote_addr, None)
-        self.assertEqual(play_context.remote_user, pwd.getpwuid(os.geteuid())[0])
+        self.assertEqual(play_context.remote_user, None)
         self.assertEqual(play_context.password, '')
         self.assertEqual(play_context.port, None)
         self.assertEqual(play_context.private_key_file, C.DEFAULT_PRIVATE_KEY_FILE)
@@ -79,7 +78,6 @@ class TestPlayContext(unittest.TestCase):
         self.assertEqual(play_context.remote_user, 'mock')
         self.assertEqual(play_context.password, '')
         self.assertEqual(play_context.port, 1234)
-        self.assertEqual(play_context.no_log, True)
         self.assertEqual(play_context.become, True)
         self.assertEqual(play_context.become_method, "mock")
         self.assertEqual(play_context.become_user, "mockroot")
@@ -87,27 +85,35 @@ class TestPlayContext(unittest.TestCase):
         mock_task = MagicMock()
         mock_task.connection    = 'mocktask'
         mock_task.remote_user   = 'mocktask'
+        mock_task.no_log        =  mock_play.no_log
         mock_task.become        = True
         mock_task.become_method = 'mocktask'
         mock_task.become_user   = 'mocktaskroot'
         mock_task.become_pass   = 'mocktaskpass'
-        mock_task.no_log        = False
+        mock_task._local_action = False
+        mock_task.delegate_to   = None
 
         all_vars = dict(
             ansible_connection = 'mock_inventory',
             ansible_ssh_port = 4321,
         )
 
+        mock_templar = MagicMock()
+
         play_context = PlayContext(play=mock_play, options=options)
-        play_context = play_context.set_task_and_variable_override(task=mock_task, variables=all_vars)
+        play_context = play_context.set_task_and_variable_override(task=mock_task, variables=all_vars, templar=mock_templar)
         self.assertEqual(play_context.connection, 'mock_inventory')
         self.assertEqual(play_context.remote_user, 'mocktask')
         self.assertEqual(play_context.port, 4321)
-        self.assertEqual(play_context.no_log, False)
+        self.assertEqual(play_context.no_log, True)
         self.assertEqual(play_context.become, True)
         self.assertEqual(play_context.become_method, "mocktask")
         self.assertEqual(play_context.become_user, "mocktaskroot")
         self.assertEqual(play_context.become_pass, "mocktaskpass")
+
+        mock_task.no_log        = False
+        play_context = play_context.set_task_and_variable_override(task=mock_task, variables=all_vars, templar=mock_templar)
+        self.assertEqual(play_context.no_log, False)
 
     def test_play_context_make_become_cmd(self):
         (options, args) = self._parser.parse_args([])
@@ -134,28 +140,28 @@ class TestPlayContext(unittest.TestCase):
 
         play_context.become_method = 'sudo'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable="/bin/bash")
-        self.assertEqual(cmd, """%s -c '%s %s -n -S -u %s %s -c '"'"'echo %s; %s'"'"''""" % (default_exe, sudo_exe, sudo_flags, play_context.become_user, default_exe, play_context.success_key, default_cmd))
+        self.assertEqual(cmd, """%s %s -u %s %s -c 'echo %s; %s'""" % (sudo_exe, sudo_flags, play_context.become_user, default_exe, play_context.success_key, default_cmd))
         play_context.become_pass = 'testpass'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable=default_exe)
-        self.assertEqual(cmd, """%s -c '%s %s -p "%s" -S -u %s %s -c '"'"'echo %s; %s'"'"''""" % (default_exe, sudo_exe, sudo_flags, play_context.prompt, play_context.become_user, default_exe, play_context.success_key, default_cmd))
+        self.assertEqual(cmd, """%s %s -p "%s" -u %s %s -c 'echo %s; %s'""" % (sudo_exe, sudo_flags.replace('-n',''), play_context.prompt, play_context.become_user, default_exe, play_context.success_key, default_cmd))
 
         play_context.become_pass = None
 
         play_context.become_method = 'su'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable="/bin/bash")
-        self.assertEqual(cmd, """%s -c '%s  %s -c "%s -c '"'"'echo %s; %s'"'"'"'""" % (default_exe, su_exe, play_context.become_user, default_exe, play_context.success_key, default_cmd))
+        self.assertEqual(cmd, """%s  %s -c '%s -c '"'"'echo %s; %s'"'"''""" % (su_exe, play_context.become_user, default_exe, play_context.success_key, default_cmd))
 
         play_context.become_method = 'pbrun'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable="/bin/bash")
-        self.assertEqual(cmd, """%s -c '%s -b %s -u %s '"'"'echo %s; %s'"'"''""" % (default_exe, pbrun_exe, pbrun_flags, play_context.become_user, play_context.success_key, default_cmd))
+        self.assertEqual(cmd, """%s -b %s -u %s 'echo %s; %s'""" % (pbrun_exe, pbrun_flags, play_context.become_user, play_context.success_key, default_cmd))
 
         play_context.become_method = 'pfexec'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable="/bin/bash")
-        self.assertEqual(cmd, """%s -c '%s %s "'"'"'echo %s; %s'"'"'"'""" % (default_exe, pfexec_exe, pfexec_flags, play_context.success_key, default_cmd))
+        self.assertEqual(cmd, '''%s %s "'echo %s; %s'"''' % (pfexec_exe, pfexec_flags, play_context.success_key, default_cmd))
 
         play_context.become_method = 'doas'
         cmd = play_context.make_become_cmd(cmd=default_cmd, executable="/bin/bash")
-        self.assertEqual(cmd, """%s -c '%s %s echo %s && %s %s env ANSIBLE=true %s'""" % (default_exe, doas_exe, doas_flags, play_context.success_key, doas_exe, doas_flags, default_cmd))
+        self.assertEqual(cmd, """%s %s echo %s && %s %s env ANSIBLE=true %s""" % (doas_exe, doas_flags, play_context.success_key, doas_exe, doas_flags, default_cmd))
 
         play_context.become_method = 'bad'
         self.assertRaises(AnsibleError, play_context.make_become_cmd, cmd=default_cmd, executable="/bin/bash")

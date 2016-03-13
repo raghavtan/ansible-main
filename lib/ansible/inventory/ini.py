@@ -20,15 +20,16 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 import ast
-import shlex
 import re
 
 from ansible import constants as C
-from ansible.errors import *
+from ansible.errors import AnsibleError
 from ansible.inventory.host import Host
 from ansible.inventory.group import Group
 from ansible.inventory.expand_hosts import detect_range
 from ansible.inventory.expand_hosts import expand_hostname_range
+from ansible.parsing.utils.addresses import parse_address
+from ansible.utils.shlex import shlex_split
 from ansible.utils.unicode import to_unicode
 
 class InventoryParser(object):
@@ -37,40 +38,28 @@ class InventoryParser(object):
     with their associated hosts and variable settings.
     """
 
-    def __init__(self, loader, filename=C.DEFAULT_HOST_LIST):
+    def __init__(self, loader, groups, filename=C.DEFAULT_HOST_LIST):
         self._loader = loader
         self.filename = filename
 
-        # Start with an empty host list and the default 'all' and
-        # 'ungrouped' groups.
+        # Start with an empty host list and whatever groups we're passed in
+        # (which should include the default 'all' and 'ungrouped' groups).
 
         self.hosts = {}
         self.patterns = {}
-        self.groups = dict(
-            all = Group(name='all'),
-            ungrouped = Group(name='ungrouped')
-        )
+        self.groups = groups
 
         # Read in the hosts, groups, and variables defined in the
         # inventory file.
 
         if loader:
             (data, private) = loader._get_file_contents(filename)
-            data = data.split('\n')
         else:
             with open(filename) as fh:
-                data = fh.readlines()
+                data = to_unicode(fh.read())
+        data = data.split('\n')
 
         self._parse(data)
-
-        # Finally, add all top-level groups (including 'ungrouped') as
-        # children of 'all'.
-
-        for group in self.groups.values():
-            if group.depth == 0 and group.name != 'all':
-                self.groups['all'].add_child_group(group)
-
-        # Note: we could discard self.hosts after this point.
 
     def _raise_error(self, message):
         raise AnsibleError("%s:%d: " % (self.filename, self.lineno) + message)
@@ -135,6 +124,9 @@ class InventoryParser(object):
                     del pending_declarations[groupname]
 
                 continue
+            elif line.startswith('['):
+                self._raise_error("Invalid section entry: '%s'. Please make sure that there are no spaces" % line + \
+                                  "in the section entry, and that there are no other invalid characters")
 
             # It's not a section, so the current state tells us what kind of
             # definition it must be. The individual parsers will raise an
@@ -185,6 +177,15 @@ class InventoryParser(object):
             elif decl['state'] == 'children':
                 raise AnsibleError("%s:%d: Section [%s:children] includes undefined group: %s" % (self.filename, decl['line'], decl['parent'], decl['name']))
 
+        # Finally, add all top-level groups as children of 'all'.
+        # We exclude ungrouped here because it was already added as a child of
+        # 'all' at the time it was created.
+
+        for group in self.groups.values():
+            if group.depth == 0 and group.name not in ('all', 'ungrouped'):
+                self.groups['all'].add_child_group(group)
+
+
     def _parse_group_name(self, line):
         '''
         Takes a single line and tries to parse it as a group name. Returns the
@@ -231,9 +232,9 @@ class InventoryParser(object):
         # gamma sudo=True user=root # to ignore comments
 
         try:
-            tokens = shlex.split(line, comments=True)
+            tokens = shlex_split(line, comments=True)
         except ValueError as e:
-            self._raise_error("Error parsing host definition '%s': %s" % (varstring, e))
+            self._raise_error("Error parsing host definition '%s': %s" % (line, e))
 
         (hostnames, port) = self._expand_hostpattern(tokens[0])
         hosts = self._Hosts(hostnames, port)
@@ -252,8 +253,8 @@ class InventoryParser(object):
         for h in hosts:
             for k in variables:
                 h.set_variable(k, variables[k])
-                if k == 'ansible_ssh_host':
-                    h.ipv4_address = variables[k]
+                if k in ['ansible_host', 'ansible_ssh_host']:
+                    h.address = variables[k]
 
         return hosts
 
@@ -263,30 +264,23 @@ class InventoryParser(object):
         optional port number that applies to all of them.
         '''
 
-        # Is a port number specified?
-        #
-        # This may be a mandatory :NN suffix on any square-bracketed expression
-        # (IPv6 address, IPv4 address, host name, host pattern), or an optional
-        # :NN suffix on an IPv4 address, host name, or pattern. IPv6 addresses
-        # must be in square brackets if a port is specified.
+        # Can the given hostpattern be parsed as a host with an optional port
+        # specification?
 
-        port = None
+        try:
+            (pattern, port) = parse_address(hostpattern, allow_ranges=True)
+        except:
+            # not a recognizable host pattern
+            pattern = hostpattern
+            port = None
 
-        for type in ['bracketed_hostport', 'hostport']:
-            m = self.patterns[type].match(hostpattern)
-            if m:
-                (hostpattern, port) = m.groups()
-                continue
+        # Once we have separated the pattern, we expand it into list of one or
+        # more hostnames, depending on whether it contains any [x:y] ranges.
 
-        # Now we're left with just the pattern, which results in a list of one
-        # or more hostnames, depending on whether it contains any [x:y] ranges.
-        #
-        # FIXME: We could be more strict here about validation.
-
-        if detect_range(hostpattern):
-            hostnames = expand_hostname_range(hostpattern)
+        if detect_range(pattern):
+            hostnames = expand_hostname_range(pattern)
         else:
-            hostnames = [hostpattern]
+            hostnames = [pattern]
 
         return (hostnames, port)
 
@@ -300,8 +294,7 @@ class InventoryParser(object):
 
         # Note that we decide whether or not to create a Host based solely on
         # the (non-)existence of its hostname in self.hosts. This means that one
-        # cannot add both "foo:22" and "foo:23" to the inventory. This behaviour
-        # is preserved for now, but this may be an easy FIXME.
+        # cannot add both "foo:22" and "foo:23" to the inventory.
 
         for hn in hostnames:
             if hn not in self.hosts:
@@ -313,8 +306,8 @@ class InventoryParser(object):
     @staticmethod
     def _parse_value(v):
         '''
-        Does something with something and returns something. Not for mere
-        mortals such as myself to interpret.
+        Attempt to transform the string value from an ini file into a basic python object
+        (int, dict, list, unicode string, etc).
         '''
         if "#" not in v:
             try:
@@ -361,8 +354,7 @@ class InventoryParser(object):
         # FIXME: What are the real restrictions on group names, or rather, what
         # should they be? At the moment, they must be non-empty sequences of non
         # whitespace characters excluding ':' and ']', but we should define more
-        # precise rules in order to support better diagnostics. The same applies
-        # to hostnames. It seems sensible for them both to follow DNS rules.
+        # precise rules in order to support better diagnostics.
 
         self.patterns['groupname'] = re.compile(
             r'''^
@@ -370,31 +362,5 @@ class InventoryParser(object):
                 \s*                         # ignore trailing whitespace
                 (?:\#.*)?                   # and/or a comment till the
                 $                           # end of the line
-            ''', re.X
-        )
-
-        # The following patterns match the various ways in which a port number
-        # may be specified on an IPv6 address, IPv4 address, hostname, or host
-        # pattern. All of the above may be enclosed in square brackets with a
-        # mandatory :NN suffix; or all but the first may be given without any
-        # brackets but with an :NN suffix.
-
-        self.patterns['bracketed_hostport'] = re.compile(
-            r'''^
-                \[(.+)\]                    # [host identifier]
-                :([0-9]+)                   # :port number
-                $
-            ''', re.X
-        )
-
-        self.patterns['hostport'] = re.compile(
-            r'''^
-                ((?:                        # We want to match:
-                    [^:\[\]]                # (a non-range character
-                    |                       # ...or...
-                    \[[^\]]*\]              # a complete bracketed expression)
-                )*)                         # repeated as many times as possible
-                :([0-9]+)                   # followed by a port number
-                $
             ''', re.X
         )

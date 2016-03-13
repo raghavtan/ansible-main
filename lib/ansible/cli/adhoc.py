@@ -15,17 +15,31 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
 ########################################################
+
+import os
+
 from ansible import constants as C
 from ansible.cli import CLI
-from ansible.errors import AnsibleOptionsError
+from ansible.errors import AnsibleError, AnsibleOptionsError
 from ansible.executor.task_queue_manager import TaskQueueManager
 from ansible.inventory import Inventory
-from ansible.parsing import DataLoader
+from ansible.parsing.dataloader import DataLoader
 from ansible.parsing.splitter import parse_kv
 from ansible.playbook.play import Play
+from ansible.plugins import get_all_plugin_loaders
 from ansible.utils.vars import load_extra_vars
 from ansible.vars import VariableManager
+
+try:
+    from __main__ import display
+except ImportError:
+    from ansible.utils.display import Display
+    display = Display()
+
 
 ########################################################
 
@@ -56,12 +70,12 @@ class AdHocCLI(CLI):
             help="module name to execute (default=%s)" % C.DEFAULT_MODULE_NAME,
             default=C.DEFAULT_MODULE_NAME)
 
-        self.options, self.args = self.parser.parse_args()
+        self.options, self.args = self.parser.parse_args(self.args[1:])
 
         if len(self.args) != 1:
             raise AnsibleOptionsError("Missing target hosts")
 
-        self.display.verbosity = self.options.verbosity
+        display.verbosity = self.options.verbosity
         self.validate_conflicts(runas_opts=True, vault_opts=True, fork_opts=True)
 
         return True
@@ -78,7 +92,6 @@ class AdHocCLI(CLI):
         ''' use Runner lib to do SSH things '''
 
         super(AdHocCLI, self).run()
-
 
         # only thing left should be host pattern
         pattern = self.args[0]
@@ -102,7 +115,7 @@ class AdHocCLI(CLI):
             vault_pass = CLI.read_vault_password_file(self.options.vault_password_file, loader=loader)
             loader.set_vault_password(vault_pass)
         elif self.options.ask_vault_pass:
-            vault_pass = self.ask_vault_passwords(ask_vault_pass=True, ask_new_vault_pass=False, confirm_new=False)[0]
+            vault_pass = self.ask_vault_passwords()[0]
             loader.set_vault_password(vault_pass)
 
         variable_manager = VariableManager()
@@ -111,14 +124,22 @@ class AdHocCLI(CLI):
         inventory = Inventory(loader=loader, variable_manager=variable_manager, host_list=self.options.inventory)
         variable_manager.set_inventory(inventory)
 
+        no_hosts = False
+        if len(inventory.list_hosts(pattern)) == 0:
+            # Empty inventory
+            display.warning("provided hosts list is empty, only localhost is available")
+            no_hosts = True
+
+        inventory.subset(self.options.subset)
         hosts = inventory.list_hosts(pattern)
-        if len(hosts) == 0:
-            self.display.warning("provided hosts list is empty, only localhost is available")
+        if len(hosts) == 0 and no_hosts is False:
+            # Invalid limit
+            raise AnsibleError("Specified --limit does not match any hosts")
 
         if self.options.listhosts:
-            self.display.display('  hosts (%d):' % len(hosts))
+            display.display('  hosts (%d):' % len(hosts))
             for host in hosts:
-                self.display.display('    %s' % host)
+                display.display('    %s' % host)
             return 0
 
         if self.options.module_name in C.MODULE_REQUIRE_ARGS and not self.options.module_args:
@@ -127,17 +148,28 @@ class AdHocCLI(CLI):
                 err = err + ' (did you mean to run ansible-playbook?)'
             raise AnsibleOptionsError(err)
 
+        # dynamically load any plugins from the playbook directory
+        for name, obj in get_all_plugin_loaders():
+            if obj.subdir:
+                plugin_path = os.path.join('.', obj.subdir)
+                if os.path.isdir(plugin_path):
+                    obj.add_directory(plugin_path)
+
         play_ds = self._play_ds(pattern, self.options.seconds, self.options.poll_interval)
         play = Play().load(play_ds, variable_manager=variable_manager, loader=loader)
 
-        if self.options.one_line:
+        if self.callback: 
+            cb = self.callback
+        elif self.options.one_line:
             cb = 'oneline'
         else:
             cb = 'minimal'
 
+        run_tree=False
         if self.options.tree:
             C.DEFAULT_CALLBACK_WHITELIST.append('tree')
             C.TREE_DIR = self.options.tree
+            run_tree=True
 
         # now create a task queue manager to execute the play
         self._tqm = None
@@ -146,11 +178,13 @@ class AdHocCLI(CLI):
                     inventory=inventory,
                     variable_manager=variable_manager,
                     loader=loader,
-                    display=self.display,
                     options=self.options,
                     passwords=passwords,
                     stdout_callback=cb,
+                    run_additional_callbacks=C.DEFAULT_LOAD_CALLBACK_PLUGINS,
+                    run_tree=run_tree,
                 )
+
             result = self._tqm.run(play)
         finally:
             if self._tqm:

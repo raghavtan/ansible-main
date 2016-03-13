@@ -22,6 +22,12 @@ you need to define:
 
     export EC2_URL=http://hostname_of_your_cc:port/services/Eucalyptus
 
+If you're using boto profiles (requires boto>=2.24.0) you can choose a profile
+using the --boto-profile command line argument (e.g. ec2.py --boto-profile prod) or using
+the AWS_PROFILE variable:
+
+    AWS_PROFILE=prod ansible-playbook -i ec2.py myplaybook.yml
+
 For more details, see: http://docs.pythonboto.org/en/latest/boto_config_tut.html
 
 When run against a specific host, this script returns the following variables:
@@ -135,6 +141,7 @@ except ImportError:
 
 
 class Ec2Inventory(object):
+
     def _empty_inventory(self):
         return {"_meta" : {"hostvars" : {}}}
 
@@ -148,9 +155,18 @@ class Ec2Inventory(object):
         # Index of hostname (address) to instance ID
         self.index = {}
 
+        # Boto profile to use (if any)
+        self.boto_profile = None
+
         # Read settings and parse CLI arguments
-        self.read_settings()
         self.parse_cli_args()
+        self.read_settings()
+
+        # Make sure that profile_name is not passed at all if not set
+        # as pre 2.24 boto will fall over otherwise
+        if self.boto_profile:
+            if not hasattr(boto.ec2.EC2Connection, 'profile_name'):
+                self.fail_with_error("boto version must be >= 2.24 to use profile")
 
         # Cache
         if self.args.refresh_cache:
@@ -187,10 +203,10 @@ class Ec2Inventory(object):
 
     def read_settings(self):
         ''' Reads the settings from the ec2.ini file '''
-        if six.PY2:
-            config = configparser.SafeConfigParser()
-        else:
+        if six.PY3:
             config = configparser.ConfigParser()
+        else:
+            config = configparser.SafeConfigParser()
         ec2_default_ini_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'ec2.ini')
         ec2_ini_path = os.path.expanduser(os.path.expandvars(os.environ.get('EC2_INI_PATH', ec2_default_ini_path)))
         config.read(ec2_ini_path)
@@ -290,8 +306,15 @@ class Ec2Inventory(object):
         else:
             self.all_elasticache_nodes = False
 
+        # boto configuration profile (prefer CLI argument)
+        self.boto_profile = self.args.boto_profile
+        if config.has_option('ec2', 'boto_profile') and not self.boto_profile:
+            self.boto_profile = config.get('ec2', 'boto_profile')
+
         # Cache related
         cache_dir = os.path.expanduser(config.get('ec2', 'cache_path'))
+        if self.boto_profile:
+            cache_dir = os.path.join(cache_dir, 'profile_' + self.boto_profile)
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
 
@@ -299,11 +322,22 @@ class Ec2Inventory(object):
         self.cache_path_index = cache_dir + "/ansible-ec2.index"
         self.cache_max_age = config.getint('ec2', 'cache_max_age')
 
+        if config.has_option('ec2', 'expand_csv_tags'):
+            self.expand_csv_tags = config.getboolean('ec2', 'expand_csv_tags')
+        else:
+            self.expand_csv_tags = False
+
         # Configure nested groups instead of flat namespace.
         if config.has_option('ec2', 'nested_groups'):
             self.nested_groups = config.getboolean('ec2', 'nested_groups')
         else:
             self.nested_groups = False
+
+        # Replace dash or not in group names
+        if config.has_option('ec2', 'replace_dash_in_groups'):
+            self.replace_dash_in_groups = config.getboolean('ec2', 'replace_dash_in_groups')
+        else:
+            self.replace_dash_in_groups = True
 
         # Configure which groups should be created.
         group_by_options = [
@@ -338,7 +372,7 @@ class Ec2Inventory(object):
                 self.pattern_include = re.compile(pattern_include)
             else:
                 self.pattern_include = None
-        except configparser.NoOptionError as e:
+        except configparser.NoOptionError:
             self.pattern_include = None
 
         # Do we need to exclude hosts that match a pattern?
@@ -348,7 +382,7 @@ class Ec2Inventory(object):
                 self.pattern_exclude = re.compile(pattern_exclude)
             else:
                 self.pattern_exclude = None
-        except configparser.NoOptionError as e:
+        except configparser.NoOptionError:
             self.pattern_exclude = None
 
         # Instance filters (see boto and EC2 API docs). Ignore invalid filters.
@@ -373,6 +407,8 @@ class Ec2Inventory(object):
                            help='Get all the variables about a specific instance')
         parser.add_argument('--refresh-cache', action='store_true', default=False,
                            help='Force refresh of cache by making API requests to EC2 (default: False - use cache files)')
+        parser.add_argument('--profile', '--boto-profile', action='store', dest='boto_profile',
+                           help='Use boto profile for connections to EC2')
         self.args = parser.parse_args()
 
 
@@ -399,7 +435,25 @@ class Ec2Inventory(object):
             conn = boto.connect_euca(host=self.eucalyptus_host)
             conn.APIVersion = '2010-08-31'
         else:
-            conn = ec2.connect_to_region(region)
+            conn = self.connect_to_aws(ec2, region)
+        return conn
+
+    def boto_fix_security_token_in_profile(self, connect_args):
+        ''' monkey patch for boto issue boto/boto#2100 '''
+        profile = 'profile ' + self.boto_profile
+        if boto.config.has_option(profile, 'aws_security_token'):
+            connect_args['security_token'] = boto.config.get(profile, 'aws_security_token')
+        return connect_args
+
+    def connect_to_aws(self, module, region):
+        connect_args = {}
+
+        # only pass the profile name if it's set (as it is not supported by older boto versions)
+        if self.boto_profile:
+            connect_args['profile_name'] = self.boto_profile
+            self.boto_fix_security_token_in_profile(connect_args)
+
+        conn = module.connect_to_region(region, **connect_args)
         # connect_to_region will fail "silently" by returning None if the region name is wrong or not supported
         if conn is None:
             self.fail_with_error("region name: %s likely not supported, or AWS is down.  connection to region failed." % region)
@@ -435,7 +489,7 @@ class Ec2Inventory(object):
         region '''
 
         try:
-            conn = rds.connect_to_region(region)
+            conn = self.connect_to_aws(rds, region)
             if conn:
                 instances = conn.get_all_dbinstances()
                 for instance in instances:
@@ -648,14 +702,21 @@ class Ec2Inventory(object):
         # Inventory: Group by tag keys
         if self.group_by_tag_keys:
             for k, v in instance.tags.items():
-                if v:
-                    key = self.to_safe("tag_" + k + "=" + v)
+                if self.expand_csv_tags and v and ',' in v:
+                    values = map(lambda x: x.strip(), v.split(','))
                 else:
-                    key = self.to_safe("tag_" + k)
-                self.push(self.inventory, key, dest)
-                if self.nested_groups:
-                    self.push_group(self.inventory, 'tags', self.to_safe("tag_" + k))
-                    self.push_group(self.inventory, self.to_safe("tag_" + k), key)
+                    values = [v]
+
+                for v in values:
+                    if v:
+                        key = self.to_safe("tag_" + k + "=" + v)
+                    else:
+                        key = self.to_safe("tag_" + k)
+                    self.push(self.inventory, key, dest)
+                    if self.nested_groups:
+                        self.push_group(self.inventory, 'tags', self.to_safe("tag_" + k))
+                        if v:
+                            self.push_group(self.inventory, self.to_safe("tag_" + k), key)
 
         # Inventory: Group by Route53 domain names if enabled
         if self.route53_enabled and self.group_by_route53_names:
@@ -1071,6 +1132,8 @@ class Ec2Inventory(object):
                 instance_vars['ec2_placement'] = value.zone
             elif key == 'ec2_tags':
                 for k, v in value.items():
+                    if self.expand_csv_tags and ',' in v:
+                        v = map(lambda x: x.strip(), v.split(','))
                     key = self.to_safe('ec2_tag_' + k)
                     instance_vars[key] = v
             elif key == 'ec2_groups':
@@ -1243,10 +1306,11 @@ class Ec2Inventory(object):
         return re.sub('([a-z0-9])([A-Z])', r'\1_\2', temp).lower()
 
     def to_safe(self, word):
-        ''' Converts 'bad' characters in a string to underscores so they can be
-        used as Ansible groups '''
-
-        return re.sub("[^A-Za-z0-9\_]", "_", word)
+        ''' Converts 'bad' characters in a string to underscores so they can be used as Ansible groups '''
+        regex = "[^A-Za-z0-9\_"
+        if not self.replace_dash_in_groups:
+            regex += "\-"
+        return re.sub(regex + "]", "_", word)
 
     def json_format_dict(self, data, pretty=False):
         ''' Converts a dict to a JSON object and dumps it as a formatted
@@ -1260,3 +1324,4 @@ class Ec2Inventory(object):
 
 # Run the script
 Ec2Inventory()
+

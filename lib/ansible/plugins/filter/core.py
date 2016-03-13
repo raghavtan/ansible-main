@@ -15,7 +15,10 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import absolute_import
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
 
 import sys
 import base64
@@ -38,13 +41,14 @@ import uuid
 import yaml
 from jinja2.filters import environmentfilter
 from distutils.version import LooseVersion, StrictVersion
-from six import iteritems
+from ansible.compat.six import iteritems, string_types
 
 from ansible import errors
 from ansible.parsing.yaml.dumper import AnsibleDumper
 from ansible.utils.hashing import md5s, checksum_s
 from ansible.utils.unicode import unicode_wrap, to_unicode
 from ansible.utils.vars import merge_hash
+from ansible.vars.hostvars import HostVars
 
 try:
     import passlib.hash
@@ -54,6 +58,17 @@ except:
 
 
 UUID_NAMESPACE_ANSIBLE = uuid.UUID('361E6D51-FAEC-444A-9079-341386DA8E2E')
+
+class AnsibleJSONEncoder(json.JSONEncoder):
+    '''
+    Simple encoder class to deal with JSON encoding of internal
+    types like HostVars
+    '''
+    def default(self, o):
+        if isinstance(o, HostVars):
+            return dict(o)
+        else:
+            return o
 
 def to_yaml(a, *args, **kw):
     '''Make verbose, human readable yaml'''
@@ -67,7 +82,7 @@ def to_nice_yaml(a, *args, **kw):
 
 def to_json(a, *args, **kw):
     ''' Convert the value to JSON '''
-    return json.dumps(a, *args, **kw)
+    return json.dumps(a, cls=AnsibleJSONEncoder, *args, **kw)
 
 def to_nice_json(a, *args, **kw):
     '''Make verbose, human readable JSON'''
@@ -85,15 +100,17 @@ def to_nice_json(a, *args, **kw):
             else:
                 if major >= 2:
                     return simplejson.dumps(a, indent=4, sort_keys=True, *args, **kw)
+    try:
+        return json.dumps(a, indent=4, sort_keys=True, cls=AnsibleJSONEncoder, *args, **kw)
+    except:
         # Fallback to the to_json filter
         return to_json(a, *args, **kw)
-    return json.dumps(a, indent=4, sort_keys=True, *args, **kw)
 
 def bool(a):
     ''' return a bool for the arg '''
     if a is None or type(a) == bool:
         return a
-    if type(a) in types.StringTypes:
+    if isinstance(a, string_types):
         a = a.lower()
     if a in ['yes', 'on', '1', 'true', 1]:
         return True
@@ -208,7 +225,11 @@ def get_encrypted_password(password, hashtype='sha512', salt=None):
     if hashtype in cryptmethod:
         if salt is None:
             r = SystemRandom()
-            salt = ''.join([r.choice(string.ascii_letters + string.digits) for _ in range(16)])
+            if hashtype in ['md5']:
+                saltsize = 8
+            else:
+                saltsize = 16
+            salt = ''.join([r.choice(string.ascii_letters + string.digits) for _ in range(saltsize)])
 
         if not HAS_PASSLIB:
             if sys.platform.startswith('darwin'):
@@ -247,6 +268,95 @@ def combine(*terms, **kwargs):
         return reduce(merge_hash, terms)
     else:
         return dict(itertools.chain(*map(iteritems, terms)))
+
+def comment(text, style='plain', **kw):
+    # Predefined comment types
+    comment_styles = {
+        'plain': {
+            'decoration': '# '
+        },
+        'erlang': {
+            'decoration': '% '
+        },
+        'c': {
+            'decoration': '// '
+        },
+        'cblock': {
+            'beginning': '/*',
+            'decoration': ' * ',
+            'end': ' */'
+        },
+        'xml': {
+            'beginning': '<!--',
+            'decoration': ' - ',
+            'end': '-->'
+        }
+    }
+
+    # Pointer to the right comment type
+    style_params = comment_styles[style]
+
+    if 'decoration' in kw:
+        prepostfix = kw['decoration']
+    else:
+        prepostfix = style_params['decoration']
+
+    # Default params
+    p = {
+        'newline': '\n',
+        'beginning': '',
+        'prefix': (prepostfix).rstrip(),
+        'prefix_count': 1,
+        'decoration': '',
+        'postfix': (prepostfix).rstrip(),
+        'postfix_count': 1,
+        'end': ''
+    }
+
+    # Update default params
+    p.update(style_params)
+    p.update(kw)
+
+    # Compose substrings for the final string
+    str_beginning = ''
+    if p['beginning']:
+        str_beginning = "%s%s" % (p['beginning'], p['newline'])
+    str_prefix = str(
+        "%s%s" % (p['prefix'], p['newline'])) * int(p['prefix_count'])
+    str_text = ("%s%s" % (
+        p['decoration'],
+        # Prepend each line of the text with the decorator
+        text.replace(
+            p['newline'], "%s%s" % (p['newline'], p['decoration'])))).replace(
+                # Remove trailing spaces when only decorator is on the line
+                "%s%s" % (p['decoration'], p['newline']),
+                "%s%s" % (p['decoration'].rstrip(), p['newline']))
+    str_postfix = p['newline'].join(
+        [''] + [p['postfix'] for x in range(p['postfix_count'])])
+    str_end = ''
+    if p['end']:
+        str_end = "%s%s" % (p['newline'], p['end'])
+
+    # Return the final string
+    return "%s%s%s%s%s" % (
+        str_beginning,
+        str_prefix,
+        str_text,
+        str_postfix,
+        str_end)
+
+def extract(item, container, morekeys=None):
+    from jinja2.runtime import Undefined
+
+    value = container[item]
+
+    if value is not Undefined and morekeys is not None:
+        if not isinstance(morekeys, list):
+            morekeys = [morekeys]
+
+        value = reduce(lambda d, k: d[k], morekeys, value)
+
+    return value
 
 class FilterModule(object):
     ''' Ansible core jinja2 filters '''
@@ -320,4 +430,10 @@ class FilterModule(object):
 
             # merge dicts
             'combine': combine,
+
+            # comment-style decoration
+            'comment': comment,
+
+            # array and dict lookups
+            'extract': extract,
         }
